@@ -11,27 +11,24 @@ state changes across filters. Events fall into three delivery categories:
 | **Event-exceptions** | to filter | Thrown from the filter's next `co_await`; see [D05+D07](../decisions.md#d05--d07-event-exception-pattern-format-change--error-handling). |
 | **Upstream** | sink → source | Out-of-band path (bypasses queues). |
 
-## In-Band Events (Downstream)
-
-These travel in the data direction and are interleaved with frames in the link,
-preserving ordering.
-
-| Event | Payload | Meaning |
-|-------|---------|---------|
-| `EOS` | (none) | No more data on this stream. |
-| `Gap` | `{pts, duration}` | No data exists for this time range (silence, still frame). |
-
 ## Event-Exceptions
 
-These are delivered by the framework directly to the filter's coroutine. The
-next `co_await` call (`pull`, `push`, `alloc`, …) throws the exception instead
-of returning normally.
+Delivered by the framework directly to the filter's coroutine. The next
+`co_await` call (`pull`, `push`, `alloc`, …) throws the exception instead of
+returning normally.
 
-| Exception | Trigger |
-|-----------|---------|
-| `Flushed` | Seek triggered a pipeline flush. |
-| `ParamChanged` | Runtime parameter was modified. |
-| `FormatChanged` | Upstream format changed (resolution, pixel format, etc.). |
+| Exception | Trigger | On uncaught |
+|-----------|---------|-------------|
+| `EndOfStream` | Upstream has no more data for this pin. | **Normal termination** — filter transitions to Done. |
+| `Absence` | Pin will never carry data (subtype of `EndOfStream`). | Same as `EndOfStream` — normal termination. |
+| `Flushed` | Seek triggered a pipeline flush. | Destroy + recreate filter. |
+| `ParamChanged` | Runtime parameter was modified. | Destroy + recreate filter. |
+| `FormatChanged` | Upstream format changed (resolution, pixel format, etc.). | Destroy + recreate filter. |
+
+`EndOfStream` and its subtype `Absence` are special: uncaught propagation
+means normal completion, not recreation. Filters that need to distinguish
+"stream ended" from "stream was never present" catch `Absence` specifically.
+All other uncaught event-exceptions trigger destroy + recreate.
 
 ### Two-Tier Filter Model
 
@@ -140,22 +137,43 @@ Or a filter can register a callback for upstream events during setup.
 
 ## EOS Protocol
 
-1. A source finishes producing data. Its coroutine returns (or explicitly
-   calls `ctx.signal_eos(pin)`).
-2. The framework enqueues an `EOS` event on each output link.
-3. Downstream filters receive `EOS` from `pull()` (returned as a sentinel
-   frame where `frame.is_eos() == true`).
-4. Upon receiving EOS on all input pins, a filter enters the **Draining**
-   state: it flushes any internally buffered frames, pushes them downstream,
-   then returns from its coroutine (propagating EOS).
-5. When all sinks have received EOS, the graph is done.
+1. A source finishes producing data. Its coroutine returns normally.
+2. The framework delivers `EndOfStream` to each downstream filter by making
+   their next `pull()` on the affected pin throw.
+3. **Simple filters** (no internal buffering): `EndOfStream` propagates
+   uncaught, coroutine terminates, filter transitions to Done.
+4. **Filters with delayed output** (encoders, lookahead): catch
+   `EndOfStream`, flush internal data, push remaining frames, then return.
+5. When all sinks have terminated, the graph is done.
 
-### Partial EOS
+### Partial EOS (Multi-Input)
 
-In a multi-input filter (e.g. a muxer), EOS may arrive on some inputs before
-others. The filter decides how to handle this — typically it continues
-processing the remaining inputs and signals EOS on its output only when all
-inputs are done.
+In a multi-input filter (e.g. a muxer), `EndOfStream` is per-pin. `pull(0)`
+may throw while `pull(1)` still returns frames. The filter catches per-pin
+and tracks which inputs are done:
+
+```cpp
+Task muxer(FilterContext& ctx) {
+    const int n = ctx.input_pin_count();
+    std::vector<bool> eos(n, false);
+    while (!std::all_of(eos.begin(), eos.end(), std::identity{})) {
+        for (int i = 0; i < n; ++i) {
+            if (eos[i]) continue;
+            try {
+                Frame f = co_await ctx.pull(i);
+                mux_frame(i, f);
+            } catch (EndOfStream&) {
+                eos[i] = true;
+            }
+        }
+    }
+}
+```
+
+For convenience, the framework also provides a `try_pull()` variant that
+returns `Result<Frame, Event>` instead of throwing — better suited for
+multi-input filters that want to handle events per-pin without try/catch
+boilerplate.
 
 ---
 

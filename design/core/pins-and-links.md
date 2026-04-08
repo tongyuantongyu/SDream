@@ -18,13 +18,17 @@ capability set, and a presence mode.
 
 | Mode | Meaning | Example |
 |------|---------|---------|
-| `always` | Pin exists as soon as the filter is created. Must be connected before `prepare()`. | The single input of a scaler. |
-| `sometimes` | Pin is created at runtime by the filter when it discovers what it needs. | A demuxer creating output pins per stream. |
-| `request` | Pin is created on demand when the user or another filter requests a connection. | Additional audio inputs on a mixer. |
+| `always` | Must be connected before `prepare()`. | The single input of a scaler. |
+| `optional` | May be left unconnected. Filter handles the absence. | A muxer's subtitle input — works without it. |
+| `request` | Created on demand at graph construction time. Pin count is a parameter. | A mixer: user requests 2, 5, or 20 input pins. |
 
-`sometimes` and `request` pins are collectively called **dynamic pins**. The
-graph construction phase must wait for dynamic pins to be materialized before
-running format negotiation on the affected links.
+All pins are resolved before `prepare()`. The graph topology never changes
+during execution. If a connected pin will carry no data (e.g. a demuxer output
+for a stream absent in the container), the filter sends `Absence` — a subtype
+of `EndOfStream` — immediately on that pin. Filters that catch `EndOfStream`
+work unchanged. Filters that need to distinguish "never had data" from "stream
+ended" can catch `Absence` specifically (e.g. a subtitle embedder calls
+`absence.as_fatal("subtitle stream required")`).
 
 ### Capability Set
 
@@ -69,22 +73,24 @@ consumer pulls, the producer suspends. If the consumer pulls before the
 producer pushes, the consumer suspends. This is the simplest possible link
 semantics.
 
-In-band events (`EOS`, `Gap`) are delivered through the same rendezvous,
-preserving ordering with frames.
+EOS and other event-exceptions are delivered by the framework at the filter's
+next `co_await`, not through the rendezvous. See
+[Stream Events](../pipeline/stream-events.md).
 
 ### Buffering as Explicit Filters
 
-Buffering is separated from the link abstraction. Two framework-provided
-filter types serve this role:
+Buffering is separated from the link abstraction. A framework-provided
+**FrameCache** filter serves this role:
 
-| Filter | Purpose |
-|--------|---------|
-| **BufferQueue** | Bounded FIFO of configurable capacity. Decouples producer and consumer timing. |
-| **FrameCache** | Sliding window of recent frames addressable by index or timestamp. For temporal algorithms (denoising, interpolation, scene detection). |
+- In **FIFO mode**: bounded queue, frames consumed on pull. Decouples producer
+  and consumer timing for pipeline parallelism.
+- In **cache mode**: sliding window, frames addressable by index or timestamp.
+  For temporal algorithms (denoising, interpolation, scene detection). Frames
+  are NOT consumed — they stay cached until evicted.
 
-These are filters in the physical graph — they participate in scheduling,
-backpressure, and profiling like any other filter. The scheduler decides
-when and where to auto-insert BufferQueue filters for pipeline parallelism
+FrameCache is a filter in the physical graph — it participates in scheduling,
+backpressure, and profiling like any other filter. The scheduler decides when
+and where to auto-insert FrameCache (FIFO mode) for pipeline parallelism
 (see [Scheduler — Auto-Inserted Buffering](../execution/scheduler.md#auto-inserted-buffering)).
 
 ### Fan-Out (One-to-Many)
@@ -108,46 +114,3 @@ combine multiple streams, it declares multiple input pins (e.g. a mixer has
 This asymmetry is deliberate: it avoids ambiguity about ordering and ownership
 when multiple producers target the same input.
 
-## Comments
-
-> Presence Modes — how does it work for optional/fallback/required patterns?
-
-**Response:** With concrete examples:
-
-**Optional audio (ignore if absent):** Demuxer's audio output pin has presence=`sometimes`. If the container has no audio, the pin is never created. Downstream audio filters are never linked. The graph runs video-only. The framework validates that `sometimes` pins don't require connection — unconnected `sometimes` pins are fine.
-
-**Fallback (generate silent audio):** This is application-level logic during graph construction, not a framework feature. The graph builder inspects the demuxer's pins after probe. If no audio pin exists, it inserts a silence-generator source. The framework doesn't need to know about fallback semantics.
-
-**Required subtitle (hard fail):** The subtitle embedder declares its subtitle input pin as presence=`always`. During `prepare()`, if that pin is unconnected, validation fails: *"Filter 'subtitle_embed' input pin 'subs' is not connected."* The framework enforces that `always` pins must be connected.
-
-**Other use case — variable-count inputs:** A mixer uses `request`-presence input pins. The user connects 2, 5, or 20 inputs. The mixer's coroutine iterates over however many pins exist. No fixed pin count.
-
-This covers the three presence modes without additional mechanisms. The framework's role is just enforcing `always` = must connect, `sometimes` = may connect, `request` = created on demand.
-
----
-
-> `Gap` — why needed if VFR timestamps exist?
-
-**Response:** Gap is semantically different from a timestamp jump:
-
-- VFR timestamps: "next frame is at T+500ms" — consumer doesn't know if there's data between now and T+500ms. Could be a stall, could be intentional silence.
-- Gap event: "I explicitly have NO data for this time range" — consumer can act on this (render silence, hold last frame, mux filler).
-
-This matters for: audio renderers (must output silence, not just wait), live muxers (must insert filler to maintain bitrate), and subtitle renderers (must clear display).
-
-That said, Gap is a convenience, not core infrastructure. It can be deferred — many pipelines work fine without it. If you'd prefer to leave it out initially and add it when a concrete use case demands it, that's reasonable.
-
----
-
-> BufferQueue vs FrameCache — should they be separate?
-
-**Response:** They differ in access pattern, not just storage:
-
-- **BufferQueue:** FIFO. Frames consumed (removed) on pull. Producer and consumer advance independently.
-- **FrameCache:** Random access. Frames are NOT consumed — they stay cached until evicted by the sliding window. Consumer can `peek(index)` or `peek(timestamp)`.
-
-A unified approach: **FrameCache is a superset.** A FrameCache used in FIFO-only mode (always read front, evict on advance) IS a BufferQueue. If the implementation difference is small, a single filter with a mode flag works. If random access adds meaningful overhead to the FIFO path (index maintenance, eviction policy), keeping them separate is justified.
-
-Recommendation: start with one implementation (FrameCache) and expose both interfaces. Split later if profiling shows the FIFO-only path needs to be leaner.
-
----

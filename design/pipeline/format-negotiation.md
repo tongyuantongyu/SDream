@@ -69,18 +69,28 @@ capability set size.
 
 ## Auto-Converter Registry
 
-The framework maintains a registry of auto-converter factories, each
-describing:
+The framework maintains a registry of auto-converter factories. Auto-converters
+are only inserted for **lossless** (information-preserving) conversions:
 
-- Input capability set.
-- Output capability set.
-- Cost estimate (used when multiple converters could bridge a gap — prefer the
-  cheapest).
+| Conversion | Auto-inserted? | Reason |
+|---|---|---|
+| I420 ↔ NV12 | Yes | Same data, different plane layout. |
+| Host ↔ device transfer | Yes | Bit-exact copy. |
+| s16 → f32 (audio sample format) | Yes | Widening, no precision loss. |
+| I444 → I420 | **No** | Chroma subsampling loses information. |
+| I420 → RGB | **No** | Color space conversion is lossy. |
+| Resolution change (width/height) | **No** | Requires resampling — always explicit. |
+| Sample rate change (audio) | **No** | Requires resampling — always explicit. |
 
-Plugins can register additional auto-converters, for example:
+If negotiation fails and no safe auto-converter exists, the framework reports
+the mismatch and the user must insert a converter filter explicitly.
 
-- A GPU color-space converter that can run on CUDA.
-- A hardware-accelerated resampler.
+The safe conversion registry is configurable: the user can promote an unsafe
+conversion (e.g. `I420 → RGB`) to auto-insertable for their pipeline if they
+accept the quality tradeoff.
+
+Plugins can register additional auto-converters (e.g. a GPU pixel-format
+converter for CUDA).
 
 ## User Overrides
 

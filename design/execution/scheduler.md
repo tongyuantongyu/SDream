@@ -42,14 +42,31 @@ selects one when building the graph.
 
 | Scheduler | Strategy | Best for |
 |-----------|----------|----------|
-| **Demand-driven** | Prioritize filters closer to sinks. Only wake a producer when downstream has capacity. | Offline transcoding, batch (minimizes memory). |
-| **Supply-driven** | Prioritize filters closer to sources. Eagerly fill queues. | Live capture, streaming (minimizes latency). |
-| **Hybrid / level-based** | Score each ready filter by output queue occupancy, input queue occupancy, and graph depth. | General purpose (balances throughput and memory). |
+| **Max utilization** | Wake filters aggressively, maximize pipeline parallelism. Multi-threaded, auto-inserts FrameCache (FIFO) generously. | Offline transcoding, batch processing — saturates hardware. |
+| **Constant speed** | Pace sources to match sink's real-time rate. Monitors pipeline clock; throttles sources when output latency exceeds target. | Playback, live streaming — regulates latency and bufferbloat. |
+| **Blueprint** | Execute filters in a fixed topological order, one frame at a time. Single-threaded, no auto-inserted buffers. Fully deterministic. | Professional / near-RT workflows — same input always produces same output with same timing. |
 
 The scheduling policy is a pluggable component — the scheduler's dependency
 tracking and dispatch logic are policy-agnostic. All policies operate on the
 same ready-set; only the selection heuristic differs. New policies can be
 added without modifying the scheduler core.
+
+### Blueprint Scheduler and Near-Hard-RT
+
+The blueprint scheduler approaches hard real-time by providing deterministic
+execution order, pre-allocated pools, and single-threaded operation. In
+practice, event-exceptions (Flushed, FormatChanged, ParamChanged) rarely
+occur during steady-state execution in hard-RT use cases:
+
+- **FormatChanged:** normalized by an upstream filter, or avoided entirely.
+- **Seeking:** typically not needed in live/broadcast pipelines.
+- **ParamChanged:** ill-suited for hard-RT workloads.
+- **EndOfStream:** terminates the pipeline — acceptable.
+
+For use cases that need formal hard-RT guarantees beyond what the blueprint
+scheduler provides: deterministic memory allocation (all pools pre-sized),
+lock-free structures, and page-pinned memory would be required. These can be
+layered as optional modes without changing the core design.
 
 ## Threading
 
@@ -99,6 +116,26 @@ This enables:
 Device-affine groups are orthogonal to the choice of scheduling policy and
 threading mode. Even the single-threaded scheduler supports `on_device()` by
 switching the active device context on the one thread.
+
+### Thread Pinning (Scope Guard)
+
+Some code requires same-thread execution (OpenGL contexts, thread-local
+storage, certain hardware APIs). A filter pins itself to the current thread
+for a region using a scope guard:
+
+```cpp
+{
+    auto pin = co_await ctx.pin_thread();   // pinned from here
+    gl_bindTexture(...);
+    gl_drawArrays(...);
+}   // unpinned — scheduler may migrate on next co_await
+```
+
+While the guard is active, the scheduler does not migrate the coroutine to a
+different worker. Outside the guard, the filter runs on whichever thread the
+scheduler picks. This is more flexible than a factory-level hint — a filter
+that does CPU prep + GL render + CPU postprocess only needs pinning during
+the GL portion.
 
 ## Backpressure
 

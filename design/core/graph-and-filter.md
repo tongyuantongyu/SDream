@@ -13,8 +13,6 @@ Before execution, the framework transforms it into a **physical graph** by:
    pixel-format converter between NV12 output and I420 input).
 2. **Inserting transfer filters** where linked filters reside on different
    devices (see [Data Migration](../heterogeneous/data-migration.md)).
-3. **Materializing dynamic pins** (e.g. a demuxer that creates one output pin
-   per stream discovered in the container).
 
 The user's logical graph is preserved for inspection. Debugging and profiling
 tools can display either view.
@@ -41,18 +39,18 @@ independently — each can be started, flushed, and torn down in isolation.
 ### Lifecycle
 
 ```
-  ┌─────────┐     configure()     ┌────────────┐    prepare()    ┌────────────┐
-  │ Created  ├───────────────────▶│ Configured  ├──────────────▶│ Negotiated │
-  └─────────┘                     └────────────┘                └─────┬──────┘
-                                                                      │ run()
-                                                                      ▼
-  ┌─────────┐   EOS propagated    ┌────────────┐                ┌──────────┐
-  │  Done   │◀────────────────────┤  Draining  │◀── EOS in ────│ Running  │
-  └─────────┘                     └────────────┘                └────┬─────┘
-                                                                     │
-                                        ┌─────────┐                  │
-                                        │  Error  │◀── fatal ────────┘
-                                        └─────────┘
+  ┌─────────┐   configure()   ┌────────────┐   prepare()   ┌────────────┐
+  │ Created  ├───────────────▶│ Configured  ├─────────────▶│ Negotiated │
+  └─────────┘                 └────────────┘               └─────┬──────┘
+                                                                 │ run()
+                                                                 ▼
+                              ┌─────────┐                  ┌──────────┐
+                              │  Done   │◀── EOS / return ─│ Running  │
+                              └─────────┘                  └────┬─────┘
+                                                                │
+                                   ┌─────────┐                  │
+                                   │  Error  │◀── fatal ────────┘
+                                   └─────────┘
 ```
 
 | State | Description |
@@ -61,9 +59,15 @@ independently — each can be started, flushed, and torn down in isolation.
 | **Configured** | Pins declared, static capabilities published. No data flows yet. |
 | **Negotiated** | Format negotiation complete; concrete MediaTypes fixed on all links. |
 | **Running** | Coroutine body is live. Filter pulls, processes, pushes. |
-| **Draining** | Upstream delivered EOS. Filter flushes internal buffered data (e.g. encoder delay frames), then signals EOS downstream. |
-| **Done** | All resources released. Filter can be destroyed. |
+| **Done** | Coroutine returned (normally or via uncaught `EndOfStream`). Resources released. |
 | **Error** | Unrecoverable failure. Framework applies the error policy (teardown, isolate, or restart). |
+
+EOS is delivered as an `EndOfStream` exception from `pull()`. Simple filters
+need zero EOS handling — the exception propagates, the coroutine terminates,
+and the filter transitions to Done. Filters with internal buffering (encoders,
+lookahead) catch `EndOfStream` to flush delayed frames before returning. There
+is no separate Draining state — flushing is just the filter executing its
+`catch (EndOfStream&)` block.
 
 ### Thread-Safety Contract
 
@@ -98,69 +102,3 @@ A **Filter instance** is created from a factory at graph-construction time. The
 same factory can produce multiple independent instances (e.g. two separate
 `scale` filters with different parameters in the same graph).
 
-## Comments
-
-> Dynamic pins complexity. Dig into this topic further.
-
-**Response:** Two approaches:
-
-**A — Probe-then-link (simpler):** The demuxer has a `probe()` method called before graph construction. It reads the container header and creates output pins based on what it finds. The user then links these known pins. All pin creation happens before `prepare()`. This is what FFmpeg's `avformat_find_stream_info()` does.
-
-**B — Deferred materialization (current design):** Pins are created during `prepare()`. The framework pauses, notifies the application that new pins appeared, waits for them to be connected, then resumes negotiation.
-
-Approach A is simpler and covers 95% of cases (file-based sources know their streams upfront). Approach B is needed for live sources where streams appear/disappear dynamically (e.g. MPEG-TS with changing program tables).
-
-Recommendation: start with A as the standard path. B can be added later for live use cases, as a `prepare()`-time callback: `on_new_pin(pin) → return connection target or null`.
-
----
-
-> EOS as exception. Simple filters need zero extra code.
-
-**Response:** Endorsed — this fits the event-exception pattern perfectly.
-
-```cpp
-// Simple filter: EOS propagates → coroutine terminates → Done. Zero extra code.
-Task passthrough(FilterContext& ctx) {
-    while (true) {
-        Frame f = co_await ctx.pull(0);  // throws EndOfStream
-        co_await ctx.push(0, std::move(f));
-    }
-}
-
-// Decoder: catches EOS to flush delayed frames
-Task decoder(FilterContext& ctx) {
-    auto codec = open_codec(co_await ctx.negotiate());
-    try {
-        while (true) {
-            Frame pkt = co_await ctx.pull(0);
-            // decode and push...
-        }
-    } catch (EndOfStream&) {
-        while (auto f = codec.flush())
-            co_await ctx.push(0, *f);
-    }
-}
-```
-
-Key clarification: **uncaught `EndOfStream` = normal termination (→ Done state), NOT recreate.** This differs from `FormatChanged`/`Flushed` where uncaught = recreate. The framework distinguishes exception types in `unhandled_exception()`.
-
-The Draining lifecycle state becomes implicit — it's "the filter is executing its `catch (EndOfStream&)` block."
-
-If you confirm, I'll update the lifecycle diagram, stream-events, and coroutine-model examples.
-
----
-
-> FilterFactory per-device? Shared per-device resources?
-
-**Response:** Factory should stay **global** (one factory per filter type). Reasons:
-
-- A factory is metadata (name, pins, params, device affinity list). It has no device-specific state.
-- The same H.264 decoder factory produces instances for CPU, CUDA, or VAAPI — the instance adapts to the assigned device, not the factory.
-
-For **shared per-device resources** (e.g. hardware decoder sessions, pre-allocated scratch buffers shared among instances on the same GPU): this is the DeviceProvider's responsibility. The provider manages per-device state, and filter instances request shared resources from it:
-
-```cpp
-auto session = ctx.device_provider().get_shared<HwDecoderSession>(device);
-```
-
-This keeps the factory simple (static descriptor) and centralizes device resource management in the provider (which already owns the device context). Not worth building a separate framework mechanism — let the provider handle it.
