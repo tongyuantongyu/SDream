@@ -8,12 +8,13 @@ execution.
 
 1. **Dependency tracking.** When a coroutine suspends (on pull, push, alloc,
    …), the scheduler records what it is waiting for.
-2. **Readiness detection.** When a resource becomes available (frame enqueued,
-   queue space freed, buffer returned to pool), the scheduler moves the
-   affected coroutine(s) to the ready set.
+2. **Readiness detection.** When a dependency is satisfied (a counterpart
+   reaches a matching push/pull, a buffer is returned to pool, a device
+   event fires), the scheduler moves the affected coroutine(s) to the ready
+   set.
 3. **Dispatch.** Select a ready coroutine and resume it on a worker thread.
-4. **Backpressure enforcement.** Respect queue capacity limits — never wake a
-   producer if all its output queues are full.
+4. **Backpressure enforcement.** Do not wake a producer if its downstream
+   filters are not ready to pull.
 5. **Termination.** Detect when the entire graph has finished (all filters
    Done or Error) and signal completion.
 
@@ -98,6 +99,8 @@ A filter's coroutine can migrate between groups mid-execution:
 ```cpp
 co_await ctx.on_device("cuda:0");   // suspend → resume on CUDA:0 thread
 // GPU work — running in the correct device context
+co_await ctx.alloc();
+// Continue on GPU after suspension
 co_await ctx.on_device("cpu");      // suspend → resume on CPU pool
 // CPU post-processing
 ```
@@ -127,6 +130,8 @@ for a region using a scope guard:
 {
     auto pin = co_await ctx.pin_thread();   // pinned from here
     gl_bindTexture(...);
+    co_await ctx.alloc();
+    // Resume on the same thread
     gl_drawArrays(...);
 }   // unpinned — scheduler may migrate on next co_await
 ```
@@ -152,32 +157,57 @@ suspension:
 - A link is a rendezvous: the frame passes directly when both sides are ready.
   If the producer pushes before the consumer pulls, the producer suspends. If
   the consumer pulls first, it suspends.
-- Where the scheduler auto-inserts `BufferQueue` filters (see below),
-  backpressure is bounded by the queue capacity — `push()` suspends when the
-  queue is full.
+- Where the scheduler auto-inserts `FrameCache` (FIFO mode) filters (see
+  below), backpressure is bounded by the queue capacity — `push()` suspends
+  when the queue is full.
 
 No explicit flow-control messages are needed — the suspension/resumption
 mechanism *is* the flow control.
 
 ## Auto-Inserted Buffering
 
-Links are rendezvous points with no built-in queue. The scheduler may
-auto-insert `BufferQueue` filters in the physical graph where buffering
-improves throughput or is needed for correctness. This is a **scheduler-level
-decision**, not a core invariant — different scheduler implementations may
+Links are rendezvous points with no built-in queue. The scheduler *may*
+auto-insert `FrameCache` (FIFO mode) filters in the physical graph where buffering
+improves throughput or is needed for correctness. This is a **scheduler-level decision**,
+not a core invariant — different scheduler implementations may
 choose different strategies.
 
 Typical auto-insertion triggers:
 
 | Situation | Reason |
 |-----------|--------|
-| **Fan-out branches** | Without buffering, `push()` blocks until the slowest consumer pulls. A buffer on each branch lets the producer continue. |
-| **Cross-device links** | Pipeline overlap between CPU and GPU work requires decoupling. (These links already get a transfer filter; a BufferQueue is inserted alongside it.) |
+| **Cross-device links** | Pipeline overlap between CPU and GPU work requires decoupling. (These links already get a transfer filter; a FrameCache is inserted alongside it.) |
 | **Cross-thread links** | If producer and consumer are on different threads, a buffer enables them to run in parallel. |
 
 A minimal-latency scheduler (e.g. the "blueprint" scheduler for deterministic
 pipelines) may choose to insert no buffers at all — every link stays a strict
 rendezvous.
+
+### Fan-Out Buffering
+
+The fan-out filter (auto-inserted during `prepare()`, see
+[Pins & Links — Fan-Out](../core/pins-and-links.md#fan-out-one-to-many))
+owns its own buffering via a scheduler-controlled `buffer_size` parameter.
+No per-branch FrameCache insertion is needed.
+
+With `buffer_size=1`, the fan-out uses `when_all` to broadcast each frame.
+With larger sizes, it maintains an internal ring buffer with per-branch read
+cursors and a `when_any` select loop — pulling new frames while simultaneously
+pushing older ones to branches. Each branch advances independently; a slow
+branch does not stall fast branches until the ring is full.
+
+This avoids the cascading-buffer problem that would arise from pairing a
+simple fan-out with per-branch FrameCaches: `when_all` creates a
+synchronization barrier, forcing FrameCaches on *every* branch (even fast
+ones) and requiring the scheduler to reason about fan-out + FrameCache as a
+coupled unit. A single fan-out with integrated buffering gives the scheduler
+one knob (`buffer_size`) and clean backpressure semantics.
+
+**Adaptive buffer sizing.** The scheduler can dynamically adjust the fan-out's
+`buffer_size` using the same heuristics as FrameCache sizing: scale up for
+branches with high jitter, scale down when the ring depth never drops below a
+watermark. This prevents bufferbloat on slow branches while providing headroom
+where it helps.
 
 ## Buffer Pool Backpressure
 
@@ -199,10 +229,16 @@ always a topological ordering where at least one source or ready filter can
 make progress.
 
 Deadlocks *can* still occur from resource starvation (e.g. two filters in
-different branches compete for the same fixed-size buffer pool and each
-holds one buffer while waiting for another). The scheduler can detect this
-by periodically checking for cycles in the wait-for graph. Mitigation
-strategies:
+different branches compete for the same fixed-size buffer pool and each holds
+one buffer while waiting for another).
+
+**Detection.** The scheduler detects deadlock by checking whether all
+coroutines are suspended and none are waiting on an external event (GPU
+completion, I/O, timer). If every suspended coroutine is waiting on another
+coroutine (pull waiting for push, push waiting for pull, alloc waiting for
+buffer release) and no coroutine can make progress, that is a deadlock.
+
+**Mitigation strategies:**
 
 - **Timeout:** if a filter has been suspended for longer than a configurable
   threshold, report a diagnostic.

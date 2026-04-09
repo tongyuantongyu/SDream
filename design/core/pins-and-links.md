@@ -95,15 +95,31 @@ and where to auto-insert FrameCache (FIFO mode) for pipeline parallelism
 
 ### Fan-Out (One-to-Many)
 
-An output pin may be connected to **multiple** input pins. This creates a
-**broadcast**: every frame produced on that output is delivered to all
-connected inputs. With reference-counted buffers, this is zero-copy — each
-downstream receives a shared reference to the same buffer.
+A link is always **1:1** — one output pin to one input pin. When the user
+connects one output to multiple inputs in the graph API, the framework
+auto-inserts a **fan-out filter** during `prepare()`:
 
-Each fan-out branch has its own independent link. All branches share the same
-negotiated format and device at the output pin. If a downstream consumer needs
-a different format or device, auto-inserted converter/transfer filters bridge
-the gap on that specific branch.
+```
+User view:    A.out ──→ B.in
+                    └──→ C.in
+
+Physical:     A.out ──→ FanOut.in
+                        FanOut.out_0 ──→ B.in
+                        FanOut.out_1 ──→ C.in
+```
+
+The fan-out filter has a scheduler-controlled `buffer_size`. With
+`buffer_size=1`, it broadcasts each frame via `when_all`. With larger sizes,
+it maintains an internal ring buffer with per-branch read cursors, allowing
+branches to advance independently (see
+[Async Combinators](../execution/coroutine-model.md#async-combinators)).
+With reference-counted buffers, delivery is zero-copy — each downstream
+receives a shared reference to the same buffer.
+
+All branches share the same negotiated format and device at the fan-out's
+input pin. If a downstream consumer needs a different format or device,
+auto-inserted converter/transfer filters bridge the gap on that specific
+branch.
 
 ### Fan-In (Many-to-One)
 
