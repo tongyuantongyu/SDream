@@ -122,33 +122,78 @@ double    to_seconds(Timestamp ts);
 
 Rescaling uses 128-bit intermediate multiplication to avoid overflow.
 
-## Questions
+## Comments
 
-> ├── major          : FourCC             // "vide", "audi", "side", …
-├── sub            : FourCC             // "NV12", "I420", "FL32", "ASS_", …
+> FourCC — don't like it as canonical representation. Evaluate: random UUIDs,
+> custom structured IDs, enumerations.
 
-I don't quite like FourCC, at least not as the canonical representation.
+**Response:**
 
-I'm evaluating:
+| Option | Pros | Cons |
+|--------|------|------|
+| **Random UUIDs** | Globally unique, zero collision risk | Unreadable in debugger/logs (16 bytes of noise). Slow comparison (memcmp). |
+| **Custom structured IDs** | Compact, partially readable, encodes category | Needs a registry to avoid collisions. Custom format to learn. |
+| **Enumerations** | Fast, unambiguous, zero-cost comparison | Rigid — third-party types can't extend without recompiling. Terrible for extensibility. |
 
-1. Assigning them random uuids.
+**Recommendation: structured 64-bit IDs.** Bits [63:48] = category (framework-defined: video, audio, side, tensor, …). Bits [47:0] = subtype (assigned by the framework for standard types, registered at runtime for third-party types).
 
-2. Assigning them custom ids (may or may not in uuid size), with type-indication part and subtype value part (which can be either random assigned or represent characteristics)
+- Comparison: one 64-bit `==`.
+- Readable: `category` part tells you it's video/audio/etc. Subtype is a lookup.
+- Extensible: third-party code calls `registry.register("my_format")` and gets a stable ID.
+- String aliases: `"yuv420p"`, `"I420"`, `"NV12"` all resolve to the same ID via a name table. The canonical form is the 64-bit integer; strings are for human convenience and config files.
 
-3. Enumerations.
+FourCC can be a supported alias format (auto-convert to canonical ID on registration) for FFmpeg interop.
+
+---
+
+> Property key namespacing — format-based vs namespace-based.
+
+**Response:** Namespace-based (`domain:key`) is clearly better for ecosystem health:
+
+- **`video:width`** — framework-standard video property. Every filter knows this.
+- **`audio:sample_rate`** — framework-standard audio property.
+- **`h264:qp_table`** — codec-specific standard. Registered by the H.264 plugin.
+- **`com.vendor:custom_data`** — third-party private key. No collisions.
+
+Impact on ecosystem:
+
+- **Discoverability:** list all `video:*` keys to see the video property vocabulary.
+- **Conflict-free:** `h264:profile` and `hevc:profile` coexist without ambiguity.
+- **Forwarding rules:** framework can auto-forward all `video:*` keys through video transforms, drop codec-specific keys on transcode boundaries, and always forward `private:*` keys.
+- **Cost:** string comparison is slightly longer, but property access is not in the frame-processing hot path. The namespace prefix can be stripped at registration time and replaced with a namespace ID for fast lookup internally.
+
+Format-based naming (`_Standard` vs `Custom`) provides no structure and relies on convention that will inevitably be violated.
 
 ---
 
-> Standard Property Keys
+> Capability negotiation — flexible custom logic, standard implementation for
+> common cases, auto-conversion only for lossless, width/height not negotiated.
 
-I'm considering differentiate property sources, here are the ideas:
+**Response:** This is a significant refinement. Proposed design:
 
-1. `Standard`, `custom`
-2. `_Standard`, `Custom`, `custom`
-3. `standard`, `codec:custom`
-4. `video:standard`, `custom`
+**1. Custom negotiation logic per filter.** The filter's `negotiate()` coroutine (already in the API) can implement arbitrary logic. The framework calls it during `prepare()`:
 
-Compare the plans, focus on the impact to filter ecosystem and interop.
+```cpp
+auto fmts = co_await ctx.negotiate();
+// fmts contains proposals from neighbors; filter can accept, counter-propose, or reject
+```
 
----
+**2. Standard implementation for common cases.** A `negotiate_standard(caps)` helper intersects declarative capability sets. Most filters call this and return. Filters with special needs override.
+
+**3. Lossless-only auto-conversion.** The framework maintains a **safe conversion registry** — conversions that are known to be lossless:
+
+| Conversion | Safe? | Reason |
+|---|---|---|
+| I420 ↔ NV12 | Yes | Same data, different plane layout |
+| Host ↔ device transfer | Yes | Bit-exact copy |
+| s16 → f32 (audio) | Yes | Widening, no precision loss |
+| I444 → I420 | **No** | Chroma subsampling loses information |
+| I420 → RGB | **No** | Color space conversion is lossy |
+| Resolution change | **No** | Requires resampling |
+
+Auto-converters are only inserted for safe conversions. Unsafe conversions require the user to explicitly add a converter filter. The safe registry is configurable: the user can promote "I420 → RGB" to safe for their pipeline if they accept the tradeoff.
+
+**4. Width/height not auto-negotiated.** Agreed — spatial resolution is never auto-converted. If upstream and downstream disagree on resolution, negotiation fails with: *"Cannot negotiate: 'decode:out' produces 3840×2160 but 'encode:in' requires 1920×1080. Insert a scaler."* The graph builder (user or tool) is responsible for adding scalers explicitly.
+
+This gives maximum flexibility to advanced filters while keeping simple filters simple (just call `negotiate_standard`).
 

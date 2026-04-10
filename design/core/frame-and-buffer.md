@@ -27,20 +27,30 @@ Frame
 
 ### Writable Access
 
-A frame pulled from an input pin is **read-only by default** because other
-links (fan-out) may hold references to the same buffer. A filter that needs to
-modify the data calls:
+Buffers are shared (reference-counted) for zero-copy fan-out. A frame pulled
+from an input pin is therefore **read-only by default** — other links may hold
+references to the same buffer.
+
+Two helpers enable safe mutation:
 
 ```cpp
+// Attempt in-place access. Returns the frame if sole owner, nullptr if shared.
+Frame* inplace = ctx.try_make_writable(frame);
+
+// Guarantee writable access. No-op if sole owner; copies if shared.
 Frame writable = co_await ctx.make_writable(frame);
 ```
 
-- If `ref_count == 1`, this is a no-op (returns the same frame).
-- Otherwise, it allocates a new buffer, copies the data, and returns a frame
-  referencing the private copy.
+A filter that can process either in-place or out-of-place should prefer
+`try_make_writable` — when it succeeds, the filter avoids both an allocation
+and a copy. When it returns null, the filter falls back to allocating a
+separate output buffer.
 
-This pattern is the practical realization of **[D04]** and **[D14]** — it
-gives both zero-copy fan-out and safe mutation without requiring a
+A filter that always needs to write calls `make_writable` directly. This is a
+`co_await` because it may need to allocate from the buffer pool (which can
+suspend if the pool is exhausted).
+
+This design gives zero-copy fan-out and safe mutation without requiring a
 framework-wide copy-on-write layer.
 
 ---
@@ -104,55 +114,58 @@ memory objects), use multi-plane layout within one allocation, or extend the
 design with a `BufferList` if needed. The single-buffer model covers the vast
 majority of formats.
 
-## Questions
+## Comments
 
-~~No active questions~~.
+> pts/dts/duration as special fields vs per-frame metadata?
 
-> ├── pts            : Timestamp              // presentation time
-├── dts            : Timestamp              // decode time (absent for raw formats)
-├── duration       : Timestamp              // display/playback duration
+**Response:** Keep as special fields. The scheduler needs pts for QoS decisions on every frame. Sinks need pts for presentation timing. Muxers need pts/dts for interleaving. These are framework-level operations, not just filter-level — they need guaranteed-present, zero-cost access, not string-key lookup into a property bag. They're analogous to "length" on an array: technically metadata, but so fundamental that they belong on the struct.
 
-Would these timestamps better be special fields or just be one of the per-frame metadata?
-
-At least in video and audio world, most filters would either don't care or simply assume the fps is steady.
+Most filters do passthrough timestamps unchanged. The framework handles this automatically regardless of whether timestamps are fields or metadata. But fields make the framework's own use cheaper and type-safe.
 
 ---
 
-> ├── memory_kind    : MemoryKind             // host / device / managed / pinned
+> memory_kind — CUDA-centric? NUMA?
 
+**Response:** MemoryKind is not a fixed enum — it's an extensible tag defined per-DeviceProvider. The `host/device/managed/pinned` in the doc are examples, not exhaustive. The CPU provider can define `host_numa0`, `host_numa1`, etc. The framework treats MemoryKind as opaque — it only uses it for pool keying and transfer path lookup.
 
-
----
-
-> ├── base           : void*                  // base address (device pointer for GPU)
-├── size           : size_t                 // total allocation size in bytes
-
-How does this handle APIs that gives opaque handles?
+For NUMA-aware scheduling: CPU workers can be bound to NUMA nodes, and the scheduler can prefer buffers from the matching memory kind. This is a scheduler-level optimization, not a core framework change. Worth noting in the design but not blocking.
 
 ---
 
-> ├── buffer         : shared_ptr<Buffer>     // payload (may be null for event-only frames)
+> void* base — how to handle opaque handles (Vulkan VkBuffer, OpenGL textures)?
 
-Would it be better to invent our intrusive_ptr?
+**Response:** Good catch. `void*` doesn't cover all APIs. The buffer data accessor should be opaque to the framework:
 
----
+```
+data: DeviceHandle    // provider-specific: void*, uint64_t, or opaque struct
+```
 
-> │   ├── offset     : size_t                // byte offset from base
+The framework never dereferences this. Only filters and the DeviceProvider interpret it — a CUDA filter casts to `CUdeviceptr`, a Vulkan filter casts to `VkBuffer`. The framework's generic operations (ref counting, pool management, transfer dispatch) never touch the data handle.
 
-Is it worth the effort to support plane-merging actions more efficiently (we are forced to reallocate with current design)?
-
----
-
-> **Audio**: 1 plane for interleaved; N planes for planar (one per channel).
-
-How crazy can N become? Can we use fixed N or consider `SmallVector`?
+This is a concrete design adjustment to make.
 
 ---
 
-> e.g. a GPU surface that stores luma and chroma in different
-memory objects
+> shared_ptr vs intrusive_ptr?
 
-Are there real world examples?
+**Response:** intrusive_ptr is strictly better here. Buffer already has `ref_count` as a member. intrusive_ptr gives: no separate control block allocation, one pointer instead of two, better cache locality. Clear win — recommend adopting.
 
 ---
 
+> Plane merging efficiency?
+
+**Response:** Plane merging (combining separate planes into one allocation) is rare. When needed, allocate a new buffer and copy. The copy cost is acceptable for a rare operation. Not worth framework-level support.
+
+---
+
+> Audio N planes — how large, fixed or SmallVector?
+
+**Response:** Practical maximum: 8 (7.1 surround, planar). Immersive audio (Atmos, ambisonics) can go higher but typically uses interleaved format. Video: max 4 (YUV + alpha).
+
+Recommendation: `SmallVector<4>` (stack-allocated for ≤4, heap for rare cases). Or a fixed array of 8 if you want to avoid any heap allocation in the layout struct.
+
+---
+
+> GPU surface with luma/chroma in different memory objects — real examples?
+
+**Response:** In practice, separate allocations are uncommon. CUDA, Vulkan, VAAPI, and D3D11 all represent NV12/P010 surfaces as a single allocation with plane offsets. The "separate allocations" case is theoretical. The single-buffer model is sufficient — the `BufferList` mention can be removed.
