@@ -113,6 +113,7 @@ wait are `co_await`-able.
 | `alloc_like(src, media_type)` | No free buffer in pool | `Frame` with writable buffer, timing and properties copied from `src` |
 | `make_writable(frame)` | Need to copy and no free buffer | `Frame` with exclusive buffer |
 | `try_make_writable(frame)` | Never | `Frame*` — sole owner returns frame, shared returns nullptr |
+| `alloc_workspace(size [, mode] [, device])` | No free buffer in pool | `Workspace` handle. Mode: `Unlocked` (default) or `Locked`. See [Workspace Allocation](../heterogeneous/allocation.md#workspace-allocation). |
 | `negotiate()` | Negotiation in progress | `NegotiatedFormats` (input & output MediaTypes) |
 | `on_device(dev)` | Immediately (migrates thread) | `void` — resumes on the target device's thread |
 | `pin_thread()` | Immediately | `ScopeGuard` — scheduler won't migrate until guard is dropped |

@@ -209,6 +209,65 @@ branches with high jitter, scale down when the ring depth never drops below a
 watermark. This prevents bufferbloat on slow branches while providing headroom
 where it helps.
 
+## Filter Cloning (Automatic Parallelization)
+
+When a filter is the pipeline bottleneck and processes frames independently
+(no inter-frame state), the scheduler can parallelize it by cloning the filter
+across multiple threads.
+
+### Prerequisites
+
+A filter is eligible for cloning if its factory declares it **stateless** —
+each output frame depends only on the corresponding input frame, with no
+temporal dependencies. Examples: color space conversion, scaling, per-frame
+image filters, per-frame ML inference.
+
+Filters with inter-frame state (encoders with B-frame reordering, temporal
+denoisers, mixers) are not cloneable.
+
+### Physical Graph Transformation
+
+The scheduler inserts a distributor and merger around N clones:
+
+```
+                          ┌── Clone 0 ──┐
+Source → RoundRobin(tag) ─├── Clone 1 ──┤─ Reorder(tag) → Sink
+                          └── Clone 2 ──┘
+```
+
+- **RoundRobin:** distributes incoming frames to clones in round-robin order.
+  Tags each frame with a sequence number in the property bag.
+- **Clone 0..N-1:** identical filter instances created from the same factory.
+  Each runs on a different CPU thread.
+- **Reorder:** collects output frames from all clones. Reorders by sequence
+  tag to restore the original frame order. Outputs in-order.
+
+### Scheduler Control
+
+The scheduler decides the clone count N based on:
+
+- **Bottleneck detection:** the filter is frequently the reason other filters
+  are suspended (downstream starved, upstream blocked).
+- **Available threads:** N ≤ free worker threads in the pool.
+- **Memory budget:** each clone adds ~2 buffers in flight (1 input + 1
+  output). N clones ≈ 2N additional buffers at this pipeline stage.
+
+The clone count is adjustable at runtime:
+
+- **Scale up:** if the filter remains a bottleneck and threads/memory are
+  available.
+- **Scale down under memory pressure:** reducing N releases buffers. At N=1
+  the optimization is effectively disabled — the filter runs single-threaded
+  with no distributor/merger overhead.
+
+### Interaction with Scheduling Policies
+
+| Policy | Cloning behavior |
+|--------|-----------------|
+| **Max utilization** | Clones aggressively to saturate CPU threads. |
+| **Constant speed** | Clones only if the filter can't keep up with real-time rate. |
+| **Blueprint** | Never clones — deterministic single-threaded execution. |
+
 ## Buffer Pool Backpressure
 
 The same mechanism extends to buffer pools. When a pool is exhausted:
